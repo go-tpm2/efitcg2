@@ -1,6 +1,18 @@
 # go-tpm2/efitcg2
 
-A pure-Go TPM 2.0 transport backed by the UEFI **`EFI_TCG2_PROTOCOL`**.
+[![CI](https://github.com/go-tpm2/efitcg2/actions/workflows/ci.yml/badge.svg)](https://github.com/go-tpm2/efitcg2/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-tpm2/efitcg2.svg)](https://pkg.go.dev/github.com/go-tpm2/efitcg2)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](#conventions)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
+
+A pure-Go TPM 2.0 transport backed by the UEFI **`EFI_TCG2_PROTOCOL`**. **v0.1.1.**
+
+> Firmware-validated: the cloud-boot loader extends PCR4 through this transport's
+> `MeasureToPCR` (`HashLogExtendEvent`) on real x86 OVMF firmware (Fedora
+> `OVMF.stateless.fd` + `tpm-crb` + swtpm), confirmed in the firmware DEBUG log.
+> v0.1.1 fixes the `SubmitCommand` output block to respect the firmware's
+> `MaxResponseSize` (the CRB ceiling is 3968 = `0x1000−0x80`, not 4096) — found
+> by that real-firmware run.
 
 `efitcg2` implements
 [`github.com/go-tpm2/common`](https://github.com/go-tpm2/common)'s `Transport`
