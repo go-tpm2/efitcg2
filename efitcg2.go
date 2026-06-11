@@ -133,6 +133,47 @@ type Caller interface {
 	HashLogExtendEvent(flags uint64, dataToHash []byte, event []byte) (status uintptr, err error)
 }
 
+// CapabilityCaller is an OPTIONAL extension a Caller may also implement to
+// report the firmware's EFI_TCG2_BOOT_SERVICE_CAPABILITY.MaxResponseSize.
+// It is queried via EFI_TCG2_PROTOCOL.GetCapability (vtable index 0).
+//
+// Why it matters. SubmitCommand's OutputParameterBlockSize must not exceed
+// the firmware's MaxResponseSize: a CRB/TIS-backed EFI_TCG2_PROTOCOL (e.g.
+// OVMF) rejects an over-large output block with EFI_INVALID_PARAMETER before
+// forwarding the command, so the whole readback fails. efitcg2 type-asserts a
+// Caller to CapabilityCaller; when present and it returns a non-zero
+// MaxResponseSize with a nil error, Send clamps its output block to
+// min(requested, MaxResponseSize). A zero MaxResponseSize, an error, or a
+// Caller that does not implement this interface leaves the requested size
+// unchanged (the DefaultOutputSize fallback already fits a CRB ceiling).
+//
+// TCG "EFI Protocol Specification", "EFI_TCG2_PROTOCOL.GetCapability()" and
+// "EFI_TCG2_BOOT_SERVICE_CAPABILITY" (its MaxResponseSize member).
+type CapabilityCaller interface {
+	// GetCapability reports the firmware's
+	// EFI_TCG2_BOOT_SERVICE_CAPABILITY.MaxResponseSize (in bytes). A return
+	// of (0, nil) means "not reported"; a non-nil err means the GetCapability
+	// call itself failed — both cause Send to keep its requested size.
+	GetCapability() (maxResponseSize uint32, err error)
+}
+
+// maxResponseSize queries a Caller for its firmware MaxResponseSize via the
+// optional CapabilityCaller extension. It returns 0 when the Caller does not
+// implement CapabilityCaller, when GetCapability errors, or when the firmware
+// reports zero — i.e. 0 means "no advertised ceiling, use the requested
+// size".
+func maxResponseSize(c Caller) uint32 {
+	cc, ok := c.(CapabilityCaller)
+	if !ok {
+		return 0
+	}
+	m, err := cc.GetCapability()
+	if err != nil {
+		return 0
+	}
+	return m
+}
+
 // EFI_STATUS values used by this package. EFI_STATUS is an architecture-
 // width integer whose top bit marks an error; the low bits select the code.
 // UEFI specification, appendix "Status Codes" (EFI_SUCCESS and the
@@ -189,18 +230,23 @@ const (
 )
 
 // DefaultOutputSize is the OutputParameterBlock size efitcg2 allocates for a
-// SubmitCommand when no explicit ceiling is configured. EFI_TCG2 does not
-// publish a fixed maximum response length through SubmitCommand; 4096 bytes
-// comfortably holds any TPM 2.0 response a firmware TPM returns over this
-// path (the largest are PCR-bank reads and key blobs). TCG "EFI Protocol
+// SubmitCommand when no explicit ceiling is configured and the Caller does
+// not advertise an EFI_TCG2_BOOT_SERVICE_CAPABILITY.MaxResponseSize (see
+// CapabilityCaller). It is 0x1000-0x80 = 3968: the realistic CRB/TIS ceiling
+// a firmware TPM exposes through SubmitCommand. TCG "EFI Protocol
 // Specification", "EFI_TCG2_PROTOCOL.SubmitCommand()" (the caller sizes the
 // output block).
 //
-// INFERRED: that 4096 is always sufficient for the firmware TPM's responses
-// over SubmitCommand. The OVMF validation should confirm no real response is
-// truncated (a too-small block surfaces as ErrBufferTooSmall, which is
-// observable, not silent).
-const DefaultOutputSize = 4096
+// INFERRED, NOW CONFIRMED ON OVMF: the original 4096 was too LARGE, not too
+// small. OVMF's CRB-backed EFI_TCG2_PROTOCOL advertises
+// MaxResponseSize = 0xF80 = 3968 and rejects any SubmitCommand whose
+// OutputParameterBlockSize exceeds it with EFI_INVALID_PARAMETER — before it
+// ever forwards the command — so a 4096-byte block made every readback
+// (e.g. PCRRead after a HashLogExtendEvent) fail. 3968 is the firmware-proven
+// maximum (an output block <= 3968 succeeds); when the Caller implements
+// CapabilityCaller, Send uses min(requested, MaxResponseSize) instead and
+// this default is only the fallback for Callers that cannot report it.
+const DefaultOutputSize = 3968
 
 // statusError maps a raw EFI_STATUS (as returned by a Caller) and a Caller
 // transport error to a Go error. err (a failure to perform the call) takes
@@ -260,16 +306,27 @@ func NewWithOutputSize(c Caller, outputSize int) *TCG2 {
 // (header + params), trimmed to the TPM response's declared responseSize. It
 // satisfies common.Transport.
 //
-// cmd becomes the InputParameterBlock; a freshly allocated buffer of
-// t.outputSize bytes is the OutputParameterBlock the firmware writes into.
+// cmd becomes the InputParameterBlock; a freshly allocated OutputParameter-
+// Block the firmware writes into is sized to t.outputSize, but never larger
+// than the firmware's EFI_TCG2_BOOT_SERVICE_CAPABILITY.MaxResponseSize when
+// the Caller advertises one via the optional CapabilityCaller extension: an
+// over-large output block is rejected with EFI_INVALID_PARAMETER by CRB/TIS-
+// backed firmware (e.g. OVMF) before the command is forwarded. So the block
+// length is min(t.outputSize, MaxResponseSize) when MaxResponseSize is
+// non-zero, else t.outputSize.
+//
 // On EFI_SUCCESS, Send parses the 10-byte TPM 2.0 response header
 // (common.GetU32 of responseSize at offset 2), bounds-checks it against the
 // header length and the output buffer, and returns the response sliced to
 // that size. TCG "EFI Protocol Specification",
-// "EFI_TCG2_PROTOCOL.SubmitCommand()"; TCG "TPM 2.0 Part 1: Architecture",
-// response header layout.
+// "EFI_TCG2_PROTOCOL.SubmitCommand()" and "EFI_TCG2_PROTOCOL.GetCapability()";
+// TCG "TPM 2.0 Part 1: Architecture", response header layout.
 func (t *TCG2) Send(cmd []byte) (rsp []byte, err error) {
-	out := make([]byte, t.outputSize)
+	outputSize := t.outputSize
+	if m := maxResponseSize(t.c); m != 0 && int(m) < outputSize {
+		outputSize = int(m)
+	}
+	out := make([]byte, outputSize)
 	status, callErr := t.c.SubmitCommand(cmd, out)
 	if e := statusError(status, callErr); e != nil {
 		return nil, e

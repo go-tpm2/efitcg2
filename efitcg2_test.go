@@ -49,6 +49,19 @@ func (f *fakeCaller) HashLogExtendEvent(flags uint64, dataToHash []byte, event [
 	return f.hleStatus, f.hleErr
 }
 
+// capCaller is a fakeCaller that also implements CapabilityCaller, reporting
+// a canned MaxResponseSize / GetCapability error so Send's output-block
+// clamp can be exercised.
+type capCaller struct {
+	fakeCaller
+	capMax uint32
+	capErr error
+}
+
+func (c *capCaller) GetCapability() (uint32, error) {
+	return c.capMax, c.capErr
+}
+
 // tpmResponse builds a minimal well-formed TPM 2.0 response buffer of the
 // given total size (>= HeaderSize) with the responseSize field set to size.
 func tpmResponse(size int, rc uint32) []byte {
@@ -107,6 +120,87 @@ func TestNewDefaults(t *testing.T) {
 	}
 	if got := NewWithOutputSize(f, 256).outputSize; got != 256 {
 		t.Fatalf("explicit outputSize = %d, want 256", got)
+	}
+}
+
+func TestDefaultOutputSizeFitsCRBCeiling(t *testing.T) {
+	// The firmware-proven CRB/TIS ceiling (OVMF MaxResponseSize = 0xF80).
+	// DefaultOutputSize must not exceed it, or a default Send is rejected
+	// with EFI_INVALID_PARAMETER before the command is forwarded.
+	const crbCeiling = 0x1000 - 0x80 // 3968
+	if DefaultOutputSize != crbCeiling {
+		t.Fatalf("DefaultOutputSize = %d, want %d", DefaultOutputSize, crbCeiling)
+	}
+}
+
+func TestSendClampsToMaxResponseSize(t *testing.T) {
+	// A CapabilityCaller advertising MaxResponseSize < requested clamps the
+	// OutputParameterBlock to MaxResponseSize (the min() picks the cap).
+	resp := tpmResponse(24, uint32(common.RCSuccess))
+	c := &capCaller{capMax: 100}
+	c.subResp = resp
+	c.subStatus = efiSuccess
+	if _, err := NewWithOutputSize(c, 4096).Send([]byte("cmd")); err != nil {
+		t.Fatalf("Send err = %v", err)
+	}
+	if c.subOutLen != 100 {
+		t.Fatalf("output block len = %d, want 100 (clamped to MaxResponseSize)", c.subOutLen)
+	}
+}
+
+func TestSendKeepsRequestedWhenSmaller(t *testing.T) {
+	// MaxResponseSize >= requested leaves the requested size (the min() picks
+	// the requested side).
+	resp := tpmResponse(24, uint32(common.RCSuccess))
+	c := &capCaller{capMax: 8192}
+	c.subResp = resp
+	c.subStatus = efiSuccess
+	if _, err := NewWithOutputSize(c, 256).Send([]byte("cmd")); err != nil {
+		t.Fatalf("Send err = %v", err)
+	}
+	if c.subOutLen != 256 {
+		t.Fatalf("output block len = %d, want 256 (requested kept)", c.subOutLen)
+	}
+}
+
+func TestSendCapabilityZeroFallsBack(t *testing.T) {
+	// MaxResponseSize == 0 (not reported) leaves the requested size unchanged.
+	resp := tpmResponse(24, uint32(common.RCSuccess))
+	c := &capCaller{capMax: 0}
+	c.subResp = resp
+	c.subStatus = efiSuccess
+	if _, err := NewWithOutputSize(c, 512).Send([]byte("cmd")); err != nil {
+		t.Fatalf("Send err = %v", err)
+	}
+	if c.subOutLen != 512 {
+		t.Fatalf("output block len = %d, want 512 (zero MaxResponseSize ignored)", c.subOutLen)
+	}
+}
+
+func TestSendCapabilityErrorFallsBack(t *testing.T) {
+	// GetCapability errors are treated as "not reported": requested kept.
+	resp := tpmResponse(24, uint32(common.RCSuccess))
+	c := &capCaller{capMax: 64, capErr: errors.New("getcap trap")}
+	c.subResp = resp
+	c.subStatus = efiSuccess
+	if _, err := NewWithOutputSize(c, 512).Send([]byte("cmd")); err != nil {
+		t.Fatalf("Send err = %v", err)
+	}
+	if c.subOutLen != 512 {
+		t.Fatalf("output block len = %d, want 512 (GetCapability error ignored)", c.subOutLen)
+	}
+}
+
+func TestSendNonCapabilityCallerKeepsRequested(t *testing.T) {
+	// A plain Caller (no CapabilityCaller) is never clamped: the default Send
+	// uses the full requested size. (maxResponseSize's !ok branch.)
+	resp := tpmResponse(24, uint32(common.RCSuccess))
+	f := &fakeCaller{subResp: resp, subStatus: efiSuccess}
+	if _, err := New(f).Send([]byte("cmd")); err != nil {
+		t.Fatalf("Send err = %v", err)
+	}
+	if f.subOutLen != DefaultOutputSize {
+		t.Fatalf("output block len = %d, want %d", f.subOutLen, DefaultOutputSize)
 	}
 }
 
