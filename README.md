@@ -5,14 +5,19 @@
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](#conventions)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
 
-A pure-Go TPM 2.0 transport backed by the UEFI **`EFI_TCG2_PROTOCOL`**. **v0.1.1.**
+A pure-Go TPM 2.0 transport backed by the UEFI **`EFI_TCG2_PROTOCOL`**. **v0.2.0.**
 
 > Firmware-validated: the cloud-boot loader extends PCR4 through this transport's
 > `MeasureToPCR` (`HashLogExtendEvent`) on real x86 OVMF firmware (Fedora
 > `OVMF.stateless.fd` + `tpm-crb` + swtpm), confirmed in the firmware DEBUG log.
-> v0.1.1 fixes the `SubmitCommand` output block to respect the firmware's
+> v0.1.1 fixed the `SubmitCommand` output block to respect the firmware's
 > `MaxResponseSize` (the CRB ceiling is 3968 = `0x1000−0x80`, not 4096) — found
 > by that real-firmware run.
+>
+> **v0.2.0** adds `GetEventLog`: fetch the **firmware-maintained** TCG event log
+> (via the optional `EventLogCaller`) so [`go-tpm2/attest`](https://github.com/go-tpm2/attest)
+> can `ParseEventLog` + `ReplayPCRs` it and confirm the replay matches the
+> firmware's PCRs — the attestation payoff of a measured boot.
 
 `efitcg2` implements
 [`github.com/go-tpm2/common`](https://github.com/go-tpm2/common)'s `Transport`
@@ -76,6 +81,38 @@ over a `Call(method int, args ...uintptr) uintptr` closure using the exported
 `Method*` ordinals (`MethodGetCapability` … `MethodGetResultOfSetActivePcrBanks`,
 declaration order) — that is invisible to `efitcg2`.
 
+### Optional extensions (`CapabilityCaller`, `EventLogCaller`)
+
+A `Caller` MAY also implement either of these optional interfaces; `efitcg2`
+type-asserts for them and degrades gracefully when they are absent.
+
+```go
+// CapabilityCaller (v0.1.1) — report EFI_TCG2_BOOT_SERVICE_CAPABILITY.
+// MaxResponseSize so Send clamps its SubmitCommand output block to it
+// (CRB/TIS-backed firmware rejects an over-large block). Vtable index 0.
+// (0, nil) = "not reported, use the requested/default size".
+type CapabilityCaller interface {
+    GetCapability() (maxResponseSize uint32, err error)
+}
+
+// EventLogCaller (v0.2.0) — fetch the FIRMWARE-maintained TCG event log.
+// EFI_TCG2_PROTOCOL.GetEventLog (vtable index 1) returns firmware-memory
+// ADDRESSES, not bytes, so the loader performs the whole firmware op:
+// call GetEventLog → take EventLogLocation/EventLogLastEntry/
+// EventLogTruncated → size the last TCG_PCR_EVENT2 entry → read the byte
+// range [location, lastEntry + sizeof(last entry)) from firmware memory →
+// return the assembled bytes + the firmware's truncation flag.
+type EventLogCaller interface {
+    GetEventLog(format uint32) (log []byte, truncated bool, err error)
+}
+```
+
+Reading firmware memory needs the loader's identity-mapped access, which is
+outside `efitcg2`'s UEFI-free remit — hence the firmware-memory read lives in
+the Caller, exactly like `SubmitCommand`/`HashLogExtendEvent`. `efitcg2` only
+defines the format constants, type-asserts, and returns the assembled bytes
+for `attest.ParseEventLog`.
+
 ## Loader-side integration sketch (cloud-boot)
 
 ```go
@@ -120,7 +157,9 @@ err = tpm.MeasureToPCR(8, eventType, imageBytes, []byte("kernel"))
 ## API
 
 - `New(c Caller) *TCG2` / `NewWithOutputSize(c, n)` — bind the transport;
-  the output buffer defaults to `DefaultOutputSize` (4096).
+  the output buffer defaults to `DefaultOutputSize` (3968, the firmware-proven
+  CRB ceiling `0x1000−0x80`), or the `CapabilityCaller`-reported
+  `MaxResponseSize` when smaller.
 - `(*TCG2) Send(cmd []byte) ([]byte, error)` — `common.Transport`. Calls
   `SubmitCommand` with `cmd` as the `InputParameterBlock`, parses the 10-byte
   TPM response header (`common.GetU32` of `responseSize`), bounds-checks it,
@@ -128,6 +167,13 @@ err = tpm.MeasureToPCR(8, eventType, imageBytes, []byte("kernel"))
 - `(*TCG2) MeasureToPCR(pcr, eventType uint32, data, eventDesc []byte) error`
   / `MeasureToPCRWithFlags(flags, …)` — build an `EFI_TCG2_EVENT` and call
   `HashLogExtendEvent`.
+- `(*TCG2) GetEventLog() ([]byte, error)` — fetch the firmware's crypto-agile
+  (`EventLogFormatTCG_2`) TCG event log via the optional `EventLogCaller`; the
+  bytes feed `attest.ParseEventLog` verbatim. Returns `ErrEventLogUnsupported`
+  when the Caller does not implement `EventLogCaller` (firmware never asked),
+  and surfaces the bytes **alongside** `ErrEventLogTruncated` when the firmware
+  reports the log overflowed (a truncated log will not replay to the PCRs —
+  reject it for attestation; check `errors.Is(err, efitcg2.ErrEventLogTruncated)`).
 - `TCG2ProtocolGUID` (`607f766c-7455-42be-930b-e4d76db2720f`) — pass to
   `LocateProtocol`.
 
@@ -160,13 +206,17 @@ The spec fixes the method **order**, GUID, struct **fields**, flags, and
 - **`EFI_TCG2_EVENT` packing/alignment** — assumed `#pragma pack(1)`,
   little-endian, no padding. Byte-asserted in tests against a hand-derived
   buffer; OVMF confirms firmware accepts it.
-- **`DefaultOutputSize = 4096`** — assumed sufficient for every firmware-TPM
-  response over `SubmitCommand`; a too-small block surfaces as
-  `ErrBufferTooSmall` (observable, never silent).
+- **`DefaultOutputSize = 3968`** — CONFIRMED on OVMF: the original 4096 was
+  too *large* — OVMF's CRB-backed `EFI_TCG2_PROTOCOL` advertises
+  `MaxResponseSize = 0xF80 = 3968` and rejects a larger `SubmitCommand` output
+  block with `EFI_INVALID_PARAMETER`. `CapabilityCaller` lets the firmware's
+  actual ceiling override this fallback.
 
-End-to-end validation requires a UEFI/OVMF guest exposing `EFI_TCG2`
-(the cloud-boot integration step). The unit tests here use a **fake**
-firmware Caller; **no real-firmware pass is claimed**.
+The unit tests here use a **fake** firmware Caller (including a fake
+`EventLogCaller` returning a canned crypto-agile log). End-to-end firmware
+validation — `MeasureToPCR`/`HashLogExtendEvent`, the `SubmitCommand` readback,
+and the `GetEventLog`→`attest` replay loop — lives in the cloud-boot
+integration step against real OVMF + swtpm.
 
 ## Conventions
 
