@@ -1,6 +1,20 @@
 # go-tpm2/efitcg2 CI — vet, gofmt, 100%-coverage gate, and a multi-arch
-# build matrix, on every push/PR. This is a pure-Go (CGO=0) module that is
+# TEST matrix on every push/PR. This is a pure-Go (CGO=0) module that is
 # NOT part of any workspace, so every Go invocation runs with GOWORK=off.
+#
+# The package parses the EFI TCG2 event log, which is LITTLE-ENDIAN on the
+# wire, so it must run correctly on a big-endian host too. We therefore do
+# not merely BUILD on every 64-bit target the go-tpm2 stack supports — we
+# RUN the full test suite on all six:
+#
+#   - amd64   natively on ubuntu-latest
+#   - arm64   natively on ubuntu-24.04-arm
+#   - riscv64, loong64, ppc64le, s390x under QEMU (binfmt), by cross-
+#     compiling each package's test binary with `go test -c -cover` and
+#     running it inside a docker container for the target platform.
+#
+# s390x is BIG-ENDIAN: running the tests there is the real validation that
+# the little-endian event-log decoding stays correct on a big-endian host.
 
 name: ci
 
@@ -18,9 +32,19 @@ env:
   CGO_ENABLED: 0
 
 jobs:
-  test:
-    name: vet + gofmt + 100% coverage
-    runs-on: ubuntu-latest
+  # Native test + coverage gate on amd64 and arm64. These also carry vet and
+  # gofmt (once each is enough; the arch only changes codegen, not style).
+  native:
+    name: vet + gofmt + 100% coverage (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -54,14 +78,28 @@ jobs:
           awk -v p="$pct" 'BEGIN { exit !(p+0 >= 100.0) }' || {
             echo "::error::coverage ${pct}% < 100.0%"; exit 1; }
 
-  build:
-    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+  # Cross-compile each package's test binary and RUN it under QEMU for the
+  # four non-native 64-bit targets. The coverage gate runs natively above;
+  # here we prove the code executes correctly (incl. big-endian s390x).
+  emulated:
+    name: test (${{ matrix.goarch }} via qemu)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        goos: [linux]
-        goarch: [amd64, arm64, riscv64, loong64]
+        include:
+          - goarch: riscv64
+            image: debian:trixie
+            qemu_cpu: rv64,v=true,vlen=128
+          - goarch: loong64
+            image: ghcr.io/loong64/debian:trixie
+            qemu_cpu: la464
+          - goarch: ppc64le
+            image: debian:trixie
+            qemu_cpu: power9
+          - goarch: s390x
+            image: debian:trixie
+            qemu_cpu: qemu
     steps:
       - uses: actions/checkout@v4
 
@@ -70,10 +108,43 @@ jobs:
           go-version: stable
           check-latest: true
 
-      # Prove the package compiles cleanly on every 64-bit target the
-      # go-tpm2 stack supports — no arch-specific breakage slips in.
-      - name: go build
+      - run: go version
+
+      # Register the QEMU user-mode emulators for every foreign arch so that
+      # `docker run --platform linux/<arch>` transparently runs the foreign
+      # test binaries.
+      - name: set up binfmt (QEMU)
+        run: docker run --rm --privileged tonistiigi/binfmt --install all
+
+      # Cross-compile a -cover test binary per package. `go test -c` writes
+      # one executable per package; name it after the last path segment so
+      # the names are stable and we can run each in turn.
+      - name: cross-compile test binaries
         env:
-          GOOS: ${{ matrix.goos }}
+          GOOS: linux
           GOARCH: ${{ matrix.goarch }}
-        run: go build ./...
+        run: |
+          mkdir -p /tmp/testbins
+          for pkg in $(go list ./...); do
+            name=$(basename "$pkg")
+            echo "compiling test binary for $pkg -> $name.test"
+            go test -c -cover -o "/tmp/testbins/$name.test" "$pkg"
+          done
+          ls -l /tmp/testbins
+
+      # Run every compiled test binary inside a container for the target
+      # platform, under QEMU. -test.v for legible per-test output; the
+      # container's exit status fails the job on any test failure.
+      - name: run test binaries under qemu
+        run: |
+          docker run --rm --platform linux/${{ matrix.goarch }} \
+            -e QEMU_CPU='${{ matrix.qemu_cpu }}' \
+            -v /tmp/testbins:/testbins \
+            ${{ matrix.image }} \
+            /bin/sh -c '
+              set -e
+              for t in /testbins/*.test; do
+                echo "=== running $t (linux/${{ matrix.goarch }}) ==="
+                "$t" -test.v
+              done
+            '
