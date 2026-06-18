@@ -22,9 +22,9 @@ jobs:
     name: vet + gofmt + 100% coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
           check-latest: true
@@ -63,9 +63,9 @@ jobs:
         goos: [linux]
         goarch: [amd64, arm64, riscv64, loong64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: stable
           check-latest: true
