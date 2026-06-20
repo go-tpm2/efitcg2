@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-tpm2/brand/main/social/go-tpm2.png" alt="go-tpm2/efitcg2" width="720"></p>
+
 # go-tpm2/efitcg2
 
 [![CI](https://github.com/go-tpm2/efitcg2/actions/workflows/ci.yml/badge.svg)](https://github.com/go-tpm2/efitcg2/actions/workflows/ci.yml)
